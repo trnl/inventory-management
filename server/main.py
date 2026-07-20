@@ -120,6 +120,39 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+# Restocking models
+class RestockingItem(BaseModel):
+    sku: str
+    item_name: str
+    forecasted_demand: int
+    quantity_on_hand: int
+    demand_gap: int
+    unit_cost: float
+    recommended_quantity: int
+
+class SubmittedOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+
+class CreateSubmittedOrderRequest(BaseModel):
+    items: List[SubmittedOrderItem]
+    total_value: float
+
+class SubmittedOrder(BaseModel):
+    id: str
+    order_number: str
+    items: List[dict]
+    status: str
+    order_date: str
+    expected_delivery: str
+    total_value: float
+
+# In-memory storage for submitted restocking orders
+submitted_orders = []
+submitted_order_counter = 0
+
 # API endpoints
 @app.get("/")
 def root():
@@ -228,14 +261,25 @@ def get_recent_transactions():
     return recent_transactions
 
 @app.get("/api/reports/quarterly")
-def get_quarterly_reports():
-    """Get quarterly performance reports"""
-    # Calculate quarterly statistics from orders
+def get_quarterly_reports(
+    warehouse: Optional[str] = None,
+    category: Optional[str] = None,
+    status: Optional[str] = None
+):
+    """Get quarterly performance reports with optional filtering"""
+    filtered = orders
+
+    if warehouse and warehouse != 'all':
+        filtered = [o for o in filtered if o.get('warehouse') == warehouse]
+    if category and category != 'all':
+        filtered = [o for o in filtered if o.get('category', '').lower() == category.lower()]
+    if status and status != 'all':
+        filtered = [o for o in filtered if o.get('status') == status]
+
     quarters = {}
 
-    for order in orders:
+    for order in filtered:
         order_date = order.get('order_date', '')
-        # Determine quarter
         if '2025-01' in order_date or '2025-02' in order_date or '2025-03' in order_date:
             quarter = 'Q1-2025'
         elif '2025-04' in order_date or '2025-05' in order_date or '2025-06' in order_date:
@@ -261,7 +305,6 @@ def get_quarterly_reports():
         if order.get('status') == 'Delivered':
             quarters[quarter]['delivered_orders'] += 1
 
-    # Calculate averages and fulfillment rate
     result = []
     for q, data in quarters.items():
         if data['total_orders'] > 0:
@@ -269,40 +312,140 @@ def get_quarterly_reports():
             data['fulfillment_rate'] = round((data['delivered_orders'] / data['total_orders']) * 100, 1)
         result.append(data)
 
-    # Sort by quarter
     result.sort(key=lambda x: x['quarter'])
     return result
 
 @app.get("/api/reports/monthly-trends")
-def get_monthly_trends():
-    """Get month-over-month trends"""
+def get_monthly_trends(
+    warehouse: Optional[str] = None,
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    month: Optional[str] = None
+):
+    """Get month-over-month trends with optional filtering"""
+    filtered = orders
+
+    if warehouse and warehouse != 'all':
+        filtered = [o for o in filtered if o.get('warehouse') == warehouse]
+    if category and category != 'all':
+        filtered = [o for o in filtered if o.get('category', '').lower() == category.lower()]
+    if status and status != 'all':
+        filtered = [o for o in filtered if o.get('status') == status]
+    if month and month != 'all':
+        month_str = f"2025-{int(month):02d}"
+        filtered = [o for o in filtered if o.get('order_date', '').startswith(month_str)]
+
     months = {}
 
-    for order in orders:
+    for order in filtered:
         order_date = order.get('order_date', '')
         if not order_date:
             continue
 
-        # Extract month (format: YYYY-MM-DD)
-        month = order_date[:7]  # Gets YYYY-MM
+        month_key = order_date[:7]
 
-        if month not in months:
-            months[month] = {
-                'month': month,
+        if month_key not in months:
+            months[month_key] = {
+                'month': month_key,
                 'order_count': 0,
                 'revenue': 0,
                 'delivered_count': 0
             }
 
-        months[month]['order_count'] += 1
-        months[month]['revenue'] += order.get('total_value', 0)
+        months[month_key]['order_count'] += 1
+        months[month_key]['revenue'] += order.get('total_value', 0)
         if order.get('status') == 'Delivered':
-            months[month]['delivered_count'] += 1
+            months[month_key]['delivered_count'] += 1
 
-    # Convert to list and sort
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+# Restocking endpoints
+@app.get("/api/restocking/recommendations")
+def get_restocking_recommendations(budget: float = 10000.0):
+    """Get restocking recommendations based on demand gap and budget"""
+    from datetime import datetime, timedelta
+
+    # Build lookup of inventory by SKU
+    inventory_by_sku = {item['sku']: item for item in inventory_items}
+
+    recommendations = []
+
+    for forecast in demand_forecasts:
+        sku = forecast['item_sku']
+        if sku in inventory_by_sku:
+            inv = inventory_by_sku[sku]
+            demand_gap = forecast['forecasted_demand'] - inv['quantity_on_hand']
+
+            if demand_gap > 0:
+                recommendations.append({
+                    'sku': sku,
+                    'item_name': forecast['item_name'],
+                    'forecasted_demand': forecast['forecasted_demand'],
+                    'quantity_on_hand': inv['quantity_on_hand'],
+                    'demand_gap': demand_gap,
+                    'unit_cost': inv['unit_cost'],
+                    'recommended_quantity': demand_gap
+                })
+
+    # Sort by demand_gap descending (highest gap first)
+    recommendations.sort(key=lambda x: x['demand_gap'], reverse=True)
+
+    # Apply budget constraints
+    remaining_budget = budget
+    final_recommendations = []
+
+    for item in recommendations:
+        max_affordable = int(remaining_budget / item['unit_cost'])
+        if max_affordable <= 0:
+            continue
+
+        quantity = min(item['recommended_quantity'], max_affordable)
+        item['recommended_quantity'] = quantity
+        cost = quantity * item['unit_cost']
+        remaining_budget -= cost
+        final_recommendations.append(item)
+
+    total_cost = budget - remaining_budget
+
+    return {
+        'items': final_recommendations,
+        'total_cost': round(total_cost, 2),
+        'budget_remaining': round(remaining_budget, 2)
+    }
+
+@app.post("/api/restocking/orders")
+def create_submitted_order(request: CreateSubmittedOrderRequest):
+    """Create a new submitted restocking order"""
+    global submitted_order_counter
+
+    from datetime import datetime, timedelta
+
+    submitted_order_counter += 1
+    order_number = f"RST-2025-{submitted_order_counter:04d}"
+
+    now = datetime.now()
+    order_date = now.strftime("%Y-%m-%dT%H:%M:%S")
+    expected_delivery = (now + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    new_order = {
+        'id': str(len(submitted_orders) + 1),
+        'order_number': order_number,
+        'items': [item.model_dump() for item in request.items],
+        'status': 'Submitted',
+        'order_date': order_date,
+        'expected_delivery': expected_delivery,
+        'total_value': request.total_value
+    }
+
+    submitted_orders.append(new_order)
+    return new_order
+
+@app.get("/api/restocking/orders")
+def get_submitted_orders():
+    """Get all submitted restocking orders"""
+    return submitted_orders
 
 if __name__ == "__main__":
     import uvicorn
