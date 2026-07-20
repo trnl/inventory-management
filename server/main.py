@@ -120,6 +120,39 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+# Restocking models
+class RestockingItem(BaseModel):
+    sku: str
+    item_name: str
+    forecasted_demand: int
+    quantity_on_hand: int
+    demand_gap: int
+    unit_cost: float
+    recommended_quantity: int
+
+class SubmittedOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+
+class CreateSubmittedOrderRequest(BaseModel):
+    items: List[SubmittedOrderItem]
+    total_value: float
+
+class SubmittedOrder(BaseModel):
+    id: str
+    order_number: str
+    items: List[dict]
+    status: str
+    order_date: str
+    expected_delivery: str
+    total_value: float
+
+# In-memory storage for submitted restocking orders
+submitted_orders = []
+submitted_order_counter = 0
+
 # API endpoints
 @app.get("/")
 def root():
@@ -303,6 +336,92 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+# Restocking endpoints
+@app.get("/api/restocking/recommendations")
+def get_restocking_recommendations(budget: float = 10000.0):
+    """Get restocking recommendations based on demand gap and budget"""
+    from datetime import datetime, timedelta
+
+    # Build lookup of inventory by SKU
+    inventory_by_sku = {item['sku']: item for item in inventory_items}
+
+    recommendations = []
+
+    for forecast in demand_forecasts:
+        sku = forecast['item_sku']
+        if sku in inventory_by_sku:
+            inv = inventory_by_sku[sku]
+            demand_gap = forecast['forecasted_demand'] - inv['quantity_on_hand']
+
+            if demand_gap > 0:
+                recommendations.append({
+                    'sku': sku,
+                    'item_name': forecast['item_name'],
+                    'forecasted_demand': forecast['forecasted_demand'],
+                    'quantity_on_hand': inv['quantity_on_hand'],
+                    'demand_gap': demand_gap,
+                    'unit_cost': inv['unit_cost'],
+                    'recommended_quantity': demand_gap
+                })
+
+    # Sort by demand_gap descending (highest gap first)
+    recommendations.sort(key=lambda x: x['demand_gap'], reverse=True)
+
+    # Apply budget constraints
+    remaining_budget = budget
+    final_recommendations = []
+
+    for item in recommendations:
+        max_affordable = int(remaining_budget / item['unit_cost'])
+        if max_affordable <= 0:
+            continue
+
+        quantity = min(item['recommended_quantity'], max_affordable)
+        item['recommended_quantity'] = quantity
+        cost = quantity * item['unit_cost']
+        remaining_budget -= cost
+        final_recommendations.append(item)
+
+    total_cost = budget - remaining_budget
+
+    return {
+        'items': final_recommendations,
+        'total_cost': round(total_cost, 2),
+        'budget_remaining': round(remaining_budget, 2)
+    }
+
+@app.post("/api/restocking/orders")
+def create_submitted_order(request: CreateSubmittedOrderRequest):
+    """Create a new submitted restocking order"""
+    global submitted_order_counter
+
+    from datetime import datetime, timedelta
+
+    submitted_order_counter += 1
+    order_number = f"RST-2025-{submitted_order_counter:04d}"
+
+    now = datetime.now()
+    order_date = now.strftime("%Y-%m-%dT%H:%M:%S")
+    expected_delivery = (now + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    new_order = {
+        'id': str(len(submitted_orders) + 1),
+        'order_number': order_number,
+        'items': [item.model_dump() for item in request.items],
+        'status': 'Submitted',
+        'order_date': order_date,
+        'expected_delivery': expected_delivery,
+        'total_value': request.total_value
+    }
+
+    submitted_orders.append(new_order)
+    return new_order
+
+@app.get("/api/restocking/orders")
+def get_submitted_orders():
+    """Get all submitted restocking orders"""
+    return submitted_orders
 
 if __name__ == "__main__":
     import uvicorn
